@@ -79,16 +79,73 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+
+        observed = ctx.observed_text
+        docs = list(ctx.corpus.docs) if ctx.corpus is not None else []
+
+        def sources(text):
+            return [
+                doc
+                for doc in docs
+                if text in observed
+                and any(text in line for line in doc.body.splitlines())
+            ]
+
+        kept = []
+        split_any = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if text in observed:
+                kept.append(claim)
+                continue
+
+            start = 0
+            while True:
+                cut = text.find(" và ", start)
+                if cut < 0:
+                    break
+                left, right = text[:cut].rstrip(), text[cut + 4 :].lstrip()
+                left_sources, right_sources = sources(left), sources(right)
+                pair = next(
+                    (
+                        (left_doc, right_doc)
+                        for left_doc in left_sources
+                        for right_doc in right_sources
+                        if left_doc.doc_id != right_doc.doc_id
+                    ),
+                    None,
+                )
+                if pair is not None:
+                    kept.extend(
+                        [
+                            {"text": left, "doc_id": pair[0].doc_id},
+                            {"text": right, "doc_id": pair[1].doc_id},
+                        ]
+                    )
+                    split_any = True
+                    break
+                start = cut + 4
+
+        report["claims"] = kept
+        if split_any:
+            report["abstain"] = True
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ trong các tài liệu đã quan sát để trả lời."
+            return report
+        report["citations"] = sorted(
+            {
+                claim["doc_id"]
+                for claim in kept
+                if isinstance(claim.get("doc_id"), str) and claim["doc_id"]
+            }
+        )
+        return report
